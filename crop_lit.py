@@ -2,11 +2,12 @@ import streamlit as st
 import pandas as pd
 import plotly.express as px
 import numpy as np
+import os
 
 st.caption('Crop conditions index is calculated as follows: (5 * Excellent) + (4 * Good) + (3 * Fair) + (2 * Poor) + (1 * Very Poor).')
 st.caption('Select a region, or multiple regions, and click "Run"')
 
-api_key = {{secrets.NASS}}
+api_key = os.environ['NASS']
 state = 'US'
 
 def cc(state,type):
