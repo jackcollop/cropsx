@@ -6,7 +6,7 @@ import numpy as np
 st.caption('Crop conditions index is calculated as follows: (5 * Excellent) + (4 * Good) + (3 * Fair) + (2 * Poor) + (1 * Very Poor).')
 st.caption('Select a region, or multiple regions, and click "Run"')
 
-api_key = NASS
+api_key = ${{secrets.NASS}}
 state = 'US'
 
 def cc(state,type):
