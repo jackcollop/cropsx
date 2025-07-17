@@ -20,7 +20,7 @@ def cc(state,type):
     exc['PVP'] = exc['POOR'].astype(float) + exc['VERY_POOR'].astype(float)
     exc['GE'] = exc['GOOD'].astype(float) + exc['EXCELLENT'].astype(float)
     week = exc.reset_index().end_code.iloc[-1]
-    fig = px.line(exc.reset_index().pivot(index='end_code', columns='year', values=type).iloc[:,-10:], range_x=(20,50), title=f'CROP CONDITIONS INDEX ({state})', labels={'end_code':'week'})
+    fig = px.line(exc.reset_index().pivot(index='end_code', columns='year', values=type).iloc[:,-11:], range_x=(20,50), title=f'CROP CONDITIONS INDEX ({state})', labels={'end_code':'week'})
     fig['data'][-1]['line']['width']=7
     return st.plotly_chart(fig)
 
