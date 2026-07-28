@@ -97,7 +97,7 @@ def chart(label, commodity, klass, state, metric_key, metric_label):
 st.sidebar.header('Crop Conditions')
 
 selected_commodities = st.sidebar.multiselect(
-    'Commodities', list(COMMODITIES), default=['Corn'],
+    'Commodities', list(COMMODITIES), default=['Cotton'],
 )
 selected_states = st.sidebar.multiselect(
     'Regions', STATES, default=['US'],
