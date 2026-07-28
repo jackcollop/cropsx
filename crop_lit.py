@@ -1,71 +1,127 @@
-import streamlit as st
-import pandas as pd
-import plotly.express as px
-import numpy as np
 import os
 
-st.caption('Crop conditions index is calculated as follows: (5 * Excellent) + (4 * Good) + (3 * Fair) + (2 * Poor) + (1 * Very Poor).')
-st.caption('Select a region, or multiple regions, and click "Run"')
+import pandas as pd
+import plotly.express as px
+import streamlit as st
+
+st.set_page_config(page_title='Crop Conditions', layout='wide')
 
 api_key = os.environ['NASS']
-state = 'US'
 
-def cc(state,type):
-    url = f'https://quickstats.nass.usda.gov/api/api_GET/?key={api_key}&commodity_desc=COTTON&statisticcat_desc=CONDITION&state_alpha={state}&format=csv'
-    exc = pd.read_csv(url).set_index(['year','end_code'])
-    exc = exc.pivot(columns='short_desc', values='Value')
-    exc.replace(np.nan, 0, inplace=True)
-    exc.columns = ['EXCELLENT','FAIR','GOOD','POOR','VERY_POOR']
-    exc['INDEX'] = 5*exc['EXCELLENT'].astype(float) + 4*exc['GOOD'].astype(float) + 3*exc['FAIR'].astype(float) + 2*exc['POOR'].astype(float) + exc['VERY_POOR'].astype(float)
-    exc['PVP'] = exc['POOR'].astype(float) + exc['VERY_POOR'].astype(float)
-    exc['GE'] = exc['GOOD'].astype(float) + exc['EXCELLENT'].astype(float)
-    week = exc.reset_index().end_code.iloc[-1]
-    fig = px.line(exc.reset_index().pivot(index='end_code', columns='year', values=type).iloc[:,-11:], range_x=(20,50), title=f'CROP CONDITIONS INDEX ({state})', labels={'end_code':'week'})
-    fig['data'][-1]['line']['width']=7
-    return st.plotly_chart(fig)
+# Commodity label -> NASS commodity_desc + optional class_desc filter.
+# Wheat is split by class because CONDITION data is reported separately for
+# winter and spring wheat (they cannot be pivoted together).
+COMMODITIES = {
+    'Corn': ('CORN', None),
+    'Soybeans': ('SOYBEANS', None),
+    'Winter Wheat': ('WHEAT', 'WINTER'),
+    'Spring Wheat': ('WHEAT', 'SPRING, (EXCL DURUM)'),
+    'Cotton': ('COTTON', None),
+}
 
+# Display label -> column produced in load().
+METRICS = {
+    'Condition Index': 'INDEX',
+    'Good + Excellent (%)': 'GE',
+    'Poor + Very Poor (%)': 'PVP',
+}
 
-def execute():
-    if us: cc('US','INDEX')
-    if tx: cc('TX','INDEX')
-    if ga: cc('GA','INDEX')
-    if ar: cc('AR','INDEX')
-    if al: cc('AL','INDEX')
-    if mo: cc('MO','INDEX')
-    if ms: cc('MS','INDEX')
-    if ok: cc('OK','INDEX')
-    if nm: cc('NM','INDEX')
-    if az: cc('AZ','INDEX')
-    if ca: cc('CA','INDEX')
-    if sc: cc('SC','INDEX')
-    if fl: cc('FL','INDEX')
-    if nc: cc('NC','INDEX')
-    if la: cc('LA','INDEX')
-    if va: cc('VA','INDEX')
-    if tn: cc('TN','INDEX')
+# US plus the major producing states across corn/soy/wheat/cotton belts.
+STATES = [
+    'US', 'IA', 'IL', 'IN', 'OH', 'NE', 'MN', 'SD', 'ND', 'KS', 'MO', 'WI',
+    'MI', 'KY', 'CO', 'MT', 'WA', 'ID', 'OR', 'TX', 'OK', 'AR', 'MS', 'LA',
+    'GA', 'AL', 'NC', 'SC', 'VA', 'TN', 'FL', 'CA', 'AZ', 'NM',
+]
+
+CONDITIONS = ['EXCELLENT', 'GOOD', 'FAIR', 'POOR', 'VERY POOR']
 
 
+@st.cache_data(ttl=3600, show_spinner=False)
+def load(commodity, klass, state):
+    """Return a tidy frame of weekly conditions with INDEX/GE/PVP columns."""
+    url = (
+        'https://quickstats.nass.usda.gov/api/api_GET/?'
+        f'key={api_key}&commodity_desc={commodity}'
+        f'&statisticcat_desc=CONDITION&state_alpha={state}&format=csv'
+    )
+    df = pd.read_csv(url)
+
+    # Keep only the "PCT <condition>" rows (e.g. "PCT GOOD").
+    df = df[df['unit_desc'].str.startswith('PCT')].copy()
+    if klass:
+        df = df[df['class_desc'] == klass]
+    if df.empty:
+        return None
+
+    df['cond'] = df['unit_desc'].str.replace('PCT ', '', regex=False)
+    df['Value'] = pd.to_numeric(df['Value'], errors='coerce')
+
+    wide = df.pivot_table(
+        index=['year', 'end_code'], columns='cond', values='Value', aggfunc='first'
+    )
+    for c in CONDITIONS:
+        if c not in wide.columns:
+            wide[c] = 0.0
+    wide = wide.fillna(0).astype(float)
+
+    wide['INDEX'] = (
+        5 * wide['EXCELLENT'] + 4 * wide['GOOD'] + 3 * wide['FAIR']
+        + 2 * wide['POOR'] + 1 * wide['VERY POOR']
+    )
+    wide['GE'] = wide['GOOD'] + wide['EXCELLENT']
+    wide['PVP'] = wide['POOR'] + wide['VERY POOR']
+    return wide.reset_index()
 
 
-# Sidebar configurations
-us = st.sidebar.checkbox('USA', key='a')
-tx = st.sidebar.checkbox('TX', key='b')
-ga = st.sidebar.checkbox('GA', key='c')
-ar = st.sidebar.checkbox('AR', key='d')
-al = st.sidebar.checkbox('AL', key='e')
-mo = st.sidebar.checkbox('MO', key='f')
-ms = st.sidebar.checkbox('MS', key='g')
-ok = st.sidebar.checkbox('OK', key='h')
-nm = st.sidebar.checkbox('NM', key='i')
-az = st.sidebar.checkbox('AZ', key='j')
-ca = st.sidebar.checkbox('CA', key='k')
-sc = st.sidebar.checkbox('SC', key='l')
-fl = st.sidebar.checkbox('FL', key='m')
-nc = st.sidebar.checkbox('NC', key='n')
-la = st.sidebar.checkbox('LA', key='q')
-va = st.sidebar.checkbox('VA', key='s')
-tn = st.sidebar.checkbox('TN', key='t')
+def chart(label, commodity, klass, state, metric_key, metric_label):
+    try:
+        df = load(commodity, klass, state)
+    except Exception:
+        df = None
+    if df is None or df.empty:
+        st.info(f'No {label} condition data available for {state}.')
+        return
+
+    # Weeks (end_code) on the x-axis, one line per year (last 11 years).
+    series = df.pivot(index='end_code', columns='year', values=metric_key).iloc[:, -11:]
+    fig = px.line(
+        series,
+        title=f'{label.upper()} — {metric_label} ({state})',
+        labels={'end_code': 'week', 'value': metric_label, 'year': 'year'},
+    )
+    fig['data'][-1]['line']['width'] = 7  # emphasise the most recent year
+    st.plotly_chart(fig, use_container_width=True)
 
 
+# --- Sidebar controls -------------------------------------------------------
+st.sidebar.header('Crop Conditions')
 
-run_btn = st.sidebar.button('Run', on_click=execute, key='z')
+selected_commodities = st.sidebar.multiselect(
+    'Commodities', list(COMMODITIES), default=['Corn'],
+)
+selected_states = st.sidebar.multiselect(
+    'Regions', STATES, default=['US'],
+)
+metric_label = st.sidebar.radio('Metric', list(METRICS))
+metric_key = METRICS[metric_label]
+
+run_btn = st.sidebar.button('Run')
+
+# --- Main -------------------------------------------------------------------
+st.caption(
+    'Condition Index = (5 * Excellent) + (4 * Good) + (3 * Fair) '
+    '+ (2 * Poor) + (1 * Very Poor).'
+)
+st.caption(
+    'Good + Excellent and Poor + Very Poor are the summed percentages for '
+    'those categories.'
+)
+st.caption('Select commodities and regions, choose a metric, and click "Run".')
+
+if run_btn:
+    if not selected_commodities or not selected_states:
+        st.warning('Select at least one commodity and one region.')
+    for label in selected_commodities:
+        commodity, klass = COMMODITIES[label]
+        for state in selected_states:
+            chart(label, commodity, klass, state, metric_key, metric_label)
