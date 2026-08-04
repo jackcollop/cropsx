@@ -1,3 +1,4 @@
+import datetime
 import os
 
 import pandas as pd
@@ -73,6 +74,79 @@ def load(commodity, klass, state):
     return wide.reset_index()
 
 
+@st.cache_data(ttl=3600, show_spinner=False)
+def load_states(commodity, klass):
+    """Return latest-week Good + Excellent per state for a commodity.
+
+    Fetches every state in one API call (no state_alpha filter) rather than
+    one call per state, then keeps the most recent week for each state.
+    """
+    this_year = datetime.date.today().year
+    url = (
+        'https://quickstats.nass.usda.gov/api/api_GET/?'
+        f'key={api_key}&commodity_desc={commodity}'
+        f'&statisticcat_desc=CONDITION&agg_level_desc=STATE'
+        f'&year__GE={this_year - 1}&format=csv'
+    )
+    df = pd.read_csv(url)
+
+    df = df[df['unit_desc'].str.startswith('PCT')].copy()
+    if klass:
+        df = df[df['class_desc'] == klass]
+    if df.empty:
+        return None
+
+    df['cond'] = df['unit_desc'].str.replace('PCT ', '', regex=False)
+    df['Value'] = pd.to_numeric(df['Value'], errors='coerce')
+
+    wide = df.pivot_table(
+        index=['state_alpha', 'year', 'end_code'],
+        columns='cond', values='Value', aggfunc='first',
+    )
+    for c in CONDITIONS:
+        if c not in wide.columns:
+            wide[c] = 0.0
+    wide = wide.fillna(0).astype(float)
+    wide['GE'] = wide['GOOD'] + wide['EXCELLENT']
+    wide = wide.reset_index()
+
+    # Keep only the most recent week available for each state.
+    latest_year = wide['year'].max()
+    wide = wide[wide['year'] == latest_year]
+    idx = wide.groupby('state_alpha')['end_code'].idxmax()
+    latest = wide.loc[idx, ['state_alpha', 'end_code', 'GE']].copy()
+    latest['year'] = latest_year
+    return latest
+
+
+def state_map(label, commodity, klass):
+    """Render a US choropleth of Good + Excellent (%) by state."""
+    try:
+        df = load_states(commodity, klass)
+    except Exception:
+        df = None
+    if df is None or df.empty:
+        st.info(f'No {label} condition data available yet this season.')
+        return
+
+    week = int(df['end_code'].max())
+    year = int(df['year'].iloc[0])
+    fig = px.choropleth(
+        df,
+        locations='state_alpha',
+        locationmode='USA-states',
+        color='GE',
+        scope='usa',
+        color_continuous_scale='RdYlGn',
+        range_color=(0, 100),
+        labels={'GE': 'Good + Excellent (%)', 'state_alpha': 'State'},
+        title=f'{label.upper()} — Good + Excellent (%) by state '
+              f'(week {week}, {year})',
+    )
+    fig.update_coloraxes(colorbar_title='G+E %')
+    st.plotly_chart(fig, use_container_width=True)
+
+
 def chart(label, commodity, klass, state, metric_key, metric_label):
     try:
         df = load(commodity, klass, state)
@@ -117,6 +191,16 @@ st.caption(
     'those categories.'
 )
 st.caption('Select commodities and regions, choose a metric, and click "Run".')
+
+# --- Overview map (renders on open) -----------------------------------------
+st.subheader('Latest crop condition by state')
+map_commodity = st.selectbox(
+    'Map commodity', list(COMMODITIES), key='map_commodity',
+)
+map_comm, map_klass = COMMODITIES[map_commodity]
+state_map(map_commodity, map_comm, map_klass)
+
+st.divider()
 
 if run_btn:
     if not selected_commodities or not selected_states:
