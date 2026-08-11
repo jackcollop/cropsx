@@ -1,0 +1,65 @@
+/* Dark chrome for the app and the Dash controls, in the browser's default
+   sans. Dash 4 themes dcc components entirely through --Dash-* custom
+   properties it defines on :root, so overriding those (from html:root, which
+   outranks a bare :root) is all it takes to darken every control. */
+
+html:root {
+  --surface: #1a1a19;
+  --page: #0d0d0d;
+  --ink: #ffffff;
+  --ink-2: #c3c2b7;
+  --muted: #898781;
+  --grid: #2c2c2a;
+  --accent: #3987e5;
+
+  --Dash-Fill-Inverse-Strong: var(--surface);
+  --Dash-Fill-Interactive-Strong: var(--accent);
+  --Dash-Fill-Interactive-Weak: rgba(57, 135, 229, 0.16);
+  --Dash-Stroke-Strong: #383835;
+  --Dash-Stroke-Weak: rgba(255, 255, 255, 0.1);
+  --Dash-Text-Primary: var(--ink);
+  --Dash-Text-Strong: var(--ink);
+  --Dash-Text-Weak: var(--ink-2);
+  --Dash-Text-Disabled: var(--muted);
+  --Dash-Fill-Primary-Hover: rgba(255, 255, 255, 0.07);
+  --Dash-Fill-Primary-Active: rgba(255, 255, 255, 0.12);
+  --Dash-Fill-Disabled: rgba(255, 255, 255, 0.12);
+  --Dash-Shading-Strong: rgba(0, 0, 0, 0.6);
+  --Dash-Shading-Weak: rgba(0, 0, 0, 0.4);
+}
+
+html,
+body {
+  margin: 0;
+  background: var(--page);
+  color: var(--ink);
+  font-family: sans-serif;
+  font-size: 14px;
+  color-scheme: dark;
+}
+
+/* The dropdown trigger and menu inherit their text colour from the page. */
+.dash-dropdown,
+.dash-dropdown-content,
+.dash-dropdown-value,
+.dash-dropdown-option,
+.dash-dropdown-search {
+  color: var(--ink);
+  font-size: 13px;
+}
+
+.dash-dropdown-option:hover {
+  background: var(--Dash-Fill-Primary-Hover);
+}
+
+/* Radio and checklist labels are plain <label> elements. */
+label,
+.dash-options-list-option {
+  color: var(--ink);
+  font-size: 13px;
+}
+
+input[type='radio'],
+input[type='checkbox'] {
+  accent-color: var(--accent);
+}
