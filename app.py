@@ -1,12 +1,3 @@
-"""Crop conditions explorer (Dash).
-
-A US choropleth of the latest weekly USDA/NASS crop condition by state, with
-the week-over-week change labelled on each state. Click a state to see its
-season history against the previous seasons.
-
-Run: python app.py
-"""
-
 import datetime
 import os
 import time
@@ -47,9 +38,56 @@ METRICS = {
 
 CONDITIONS = ['EXCELLENT', 'GOOD', 'FAIR', 'POOR', 'VERY POOR']
 
-# Weeks 1-10 are hangovers from the prior crop year (cotton, for instance,
-# only gets going around week 20) and distort the season shape.
-FIRST_WEEK = 11
+# Each crop's condition-reporting season, as the (first, last) calendar week
+# NASS publishes weekly conditions for it. Seasonality differs enough that one
+# global cutoff cannot serve them all: spring wheat is done by week 35 while
+# cotton runs to week 47, and winter wheat's season *wraps the turn of the
+# year* — autumn establishment (weeks 39-52) belongs to the crop harvested the
+# following summer (weeks 1-33). A window whose start is after its end is read
+# as wrapping.
+#
+# Anything outside the window is a hangover from the neighbouring crop year —
+# NASS carries, for instance, a stray week-1 cotton report each January that is
+# really the tail of the previous harvest.
+SEASON = {
+    'Cotton': (12, 50),
+    'Corn': (8, 48),
+    'Soybeans': (12, 50),
+    'Spring Wheat': (12, 40),
+    'Winter Wheat': (36, 35),
+}
+
+
+def season_shape(label):
+    """(first week, last week, wraps the year end?, weeks in the season)."""
+    start, end = SEASON[label]
+    wraps = start > end
+    length = (end - start) % 52 + 1 if wraps else end - start + 1
+    return start, end, wraps, length
+
+
+def season_week(cal_week, start, wraps):
+    """Position within the crop's own season, 1-based, so seasons align."""
+    return (cal_week - start) % 52 + 1 if wraps else cal_week - start + 1
+
+
+def calendar_week(week, start):
+    """Inverse of season_week — used to label the axis in familiar weeks."""
+    return (start + week - 2) % 52 + 1
+
+
+def season_span(label, year):
+    """How a season is named: a wrapping season spans two calendar years."""
+    _, _, wraps, _ = season_shape(label)
+    return f'{year - 1}/{str(year)[-2:]}' if wraps else str(year)
+
+
+def in_season(cal_week, label):
+    """Mask of the calendar weeks that belong to this crop's season."""
+    start, end, wraps, _ = season_shape(label)
+    if wraps:
+        return (cal_week >= start) | (cal_week <= end)
+    return (cal_week >= start) & (cal_week <= end)
 
 # Every request pulls the full window once and is cached, so changing metric
 # or state costs no further API calls.
@@ -144,8 +182,16 @@ def _request(commodity, klass, first_year, last_year):
         )
 
 
-def _tidy(raw, klass):
-    """Pivot the "PCT <condition>" rows into INDEX/GE/PVP per state-week."""
+def _tidy(raw, klass, label):
+    """Pivot the "PCT <condition>" rows into INDEX/GE/PVP per state-week.
+
+    Rows are stamped with the *season* (crop year) and a season-relative week
+    rather than NASS's calendar `year` and `end_code`. Those two are not the
+    same thing for a crop that overwinters, and NASS itself is inconsistent
+    about it: most autumn winter-wheat rows carry the following crop year, but
+    a handful carry the year just harvested. Deriving the season from
+    `week_ending` gives one rule that holds for every crop.
+    """
     df = raw[raw['unit_desc'].str.startswith('PCT')].copy()
     if klass:
         df = df[df['class_desc'] == klass]
@@ -155,8 +201,27 @@ def _tidy(raw, klass):
     df['cond'] = df['unit_desc'].str.replace('PCT ', '', regex=False)
     df['Value'] = pd.to_numeric(df['Value'], errors='coerce')
 
+    start, _, wraps, _ = season_shape(label)
+    df['cal_week'] = pd.to_numeric(df['end_code'], errors='coerce').clip(1, 52)
+    ending = pd.to_datetime(df['week_ending'], errors='coerce')
+    df = df[df['cal_week'].notna() & ending.notna()]
+    if df.empty:
+        return df
+
+    df = df[in_season(df['cal_week'], label)]
+    if df.empty:
+        return df
+
+    # The season a week belongs to: its own calendar year, except that for a
+    # wrapping crop everything from the season's start week onward belongs to
+    # the season that ends the *next* summer.
+    df['season'] = ending[df.index].dt.year + (
+        (df['cal_week'] >= start).astype(int) if wraps else 0
+    )
+    df['week'] = season_week(df['cal_week'], start, wraps)
+
     wide = df.pivot_table(
-        index=['state_alpha', 'year', 'end_code', 'week_ending'],
+        index=['state_alpha', 'season', 'week', 'cal_week', 'week_ending'],
         columns='cond', values='Value', aggfunc='first',
     )
     for c in CONDITIONS:
@@ -171,11 +236,7 @@ def _tidy(raw, klass):
     wide['GE'] = wide['GOOD'] + wide['EXCELLENT']
     wide['PVP'] = wide['POOR'] + wide['VERY POOR']
 
-    out = wide.reset_index()
-    out['end_code'] = pd.to_numeric(out['end_code'], errors='coerce')
-    return out[out['end_code'] >= FIRST_WEEK].sort_values(
-        ['state_alpha', 'year', 'end_code']
-    )
+    return wide.reset_index().sort_values(['state_alpha', 'season', 'week'])
 
 
 def load(label):
@@ -192,7 +253,7 @@ def load(label):
     this_year = datetime.date.today().year
     try:
         raw = _request(commodity, klass, this_year - SEASONS + 1, this_year)
-        df = _tidy(raw, klass)
+        df = _tidy(raw, klass, label)
     except Exception:
         df = pd.DataFrame()
     _cache[label] = (time.time(), df)
@@ -200,20 +261,30 @@ def load(label):
 
 
 def snapshot(df, col):
-    """Latest week per state in the latest season, with its week-on-week move."""
+    """Latest week per state in the latest season, with its week-on-week move.
+
+    Ordered by season week, not calendar week: for a crop that overwinters the
+    two disagree, and sorting on the calendar would report last autumn's
+    reading as the most recent one.
+    """
     if df.empty:
         return pd.DataFrame()
-    season = df[df['year'] == df['year'].max()]
+    season = df[df['season'] == df['season'].max()]
     rows = []
     for state, g in season.groupby('state_alpha'):
-        g = g.sort_values('end_code')
-        prev = g[col].iloc[-2] if len(g) > 1 else None
+        g = g.sort_values('week')
+        last = g.iloc[-1]
+        # Only a genuinely consecutive report is a week-on-week move. Winter
+        # wheat goes quiet from December to February, so the reading either
+        # side of that gap is not a weekly change.
+        prev = g.iloc[-2] if len(g) > 1 else None
+        step = None if prev is None else int(last['week'] - prev['week'])
         rows.append({
             'state': state,
-            'value': g[col].iloc[-1],
-            'delta': None if prev is None else g[col].iloc[-1] - prev,
-            'week': int(g['end_code'].iloc[-1]),
-            'week_ending': g['week_ending'].iloc[-1],
+            'value': last[col],
+            'delta': last[col] - prev[col] if step == 1 else None,
+            'week': int(last['cal_week']),
+            'week_ending': last['week_ending'],
         })
     return pd.DataFrame(rows)
 
@@ -272,8 +343,10 @@ def map_figure(label, metric_label, mode, selected):
         scale = LEVEL_SCALE if higher_better else flip(LEVEL_SCALE)
         bar_title = metric_label.split(' (')[0].replace(' + ', '+<br>')
 
-    week = int(snap['week'].max())
-    ending = snap.loc[snap['week'].idxmax(), 'week_ending']
+    # The freshest reading on the map, by date — with a wrapping season a high
+    # calendar week can be the oldest thing on it, not the newest.
+    newest = snap.loc[pd.to_datetime(snap['week_ending']).idxmax()]
+    week, ending = int(newest['week']), newest['week_ending']
 
     fig = go.Figure(go.Choropleth(
         locations=snap['state'], locationmode='USA-states', z=z,
@@ -352,28 +425,30 @@ def history_figure(label, metric_label, state):
     if df.empty:
         return _blank(f'No {label.lower()} condition data for {state}.')
 
-    current = int(df['year'].max())
-    prior_years = sorted(y for y in df['year'].unique() if y < current)
+    start, _, _, _ = season_shape(label)
+    current = int(df['season'].max())
+    prior_years = sorted(y for y in df['season'].unique() if y < current)
 
     fig = go.Figure()
 
     # Every prior season, faded, oldest first so recent ones sit on top.
     for i, year in enumerate(prior_years):
-        g = df[df['year'] == year]
+        g = df[df['season'] == year].sort_values('week')
         newest = bool(year == current - 1)
         fig.add_trace(go.Scatter(
-            x=g['end_code'], y=g[col], mode='lines',
+            x=g['week'], y=g[col], mode='lines',
             line=dict(color=SERIES_2 if newest else HISTORY,
                       width=2 if newest else 1.4),
             opacity=0.8 if newest else 0.32,
-            name=str(int(year)) if newest else 'earlier seasons',
+            name=season_span(label, int(year)) if newest else 'earlier seasons',
             legendgroup=None if newest else 'prior',
             showlegend=newest or i == 0,
-            hovertemplate='%{y:.0f}<extra>' f'{int(year)}' '</extra>',
+            hovertemplate='%{y:.0f}<extra>'
+                          f'{season_span(label, int(year))}' '</extra>',
         ))
 
     if prior_years:
-        mean = df[df['year'].isin(prior_years)].groupby('end_code')[col].mean()
+        mean = df[df['season'].isin(prior_years)].groupby('week')[col].mean()
         fig.add_trace(go.Scatter(
             x=mean.index, y=mean.values, mode='lines',
             line=dict(color=INK_2, width=1.8, dash='dash'),
@@ -381,27 +456,37 @@ def history_figure(label, metric_label, state):
             hovertemplate='avg %{y:.0f}<extra></extra>',
         ))
 
-    now = df[df['year'] == current]
+    now = df[df['season'] == current].sort_values('week')
     fig.add_trace(go.Scatter(
-        x=now['end_code'], y=now[col], mode='lines+markers',
+        x=now['week'], y=now[col], mode='lines+markers',
         line=dict(color=SERIES_1, width=3), marker=dict(size=5),
-        name=str(current), customdata=now['week_ending'],
+        name=season_span(label, current), customdata=now['week_ending'],
         hovertemplate='%{y:.0f}<br>ending %{customdata}'
-                      '<extra>' f'{current}' '</extra>',
+                      '<extra>' f'{season_span(label, current)}' '</extra>',
     ))
+
+    # Plotted on the crop's own season week so seasons overlay, but ticked in
+    # the calendar weeks the trade reads. Only the weeks this crop actually
+    # reports get axis room, instead of stretching across a full year.
+    present = df['week']
+    first, last = int(present.min()), int(present.max())
+    ticks = list(range(first, last + 1, max(2, round((last - first) / 8))))
 
     fig.update_layout(
         title=dict(
             text=f'{state} — {metric_label}'
                  f'<br><span style="font-size:12px;color:{INK_2}">'
-                 f'{current} against the previous {len(prior_years)} seasons'
-                 '</span>',
+                 f'{season_span(label, current)} against the previous '
+                 f'{len(prior_years)} seasons</span>',
             font=dict(size=17, color=INK), x=0.02, y=0.96,
         ),
         xaxis=dict(
             title=dict(text='week of year', font=dict(size=11, color=INK_2)),
             gridcolor=GRID, linecolor=AXIS, zeroline=False,
             tickfont=dict(size=10, color=MUTED),
+            range=[first - 0.5, last + 0.5],
+            tickmode='array', tickvals=ticks,
+            ticktext=[str(calendar_week(w, start)) for w in ticks],
         ),
         yaxis=dict(
             range=list(span), gridcolor=GRID, linecolor=AXIS, zeroline=False,
@@ -445,15 +530,20 @@ def tiles(label, metric_label, state):
     if df.empty:
         return []
 
-    current = int(df['year'].max())
-    now = df[df['year'] == current].sort_values('end_code')
-    week = int(now['end_code'].iloc[-1])
-    value = now[col].iloc[-1]
+    current = int(df['season'].max())
+    now = df[df['season'] == current].sort_values('week')
+    last = now.iloc[-1]
+    week = int(last['week'])
+    value = last[col]
 
-    wow = value - now[col].iloc[-2] if len(now) > 1 else None
-    prior = df[(df['year'] < current) & (df['end_code'] == week)]
+    # Consecutive reports only — see snapshot(); the winter gap is not a week.
+    step = int(week - now['week'].iloc[-2]) if len(now) > 1 else None
+    wow = value - now[col].iloc[-2] if step == 1 else None
+    # Compared at the same point in each season, which for a wrapping crop is
+    # the season week rather than the calendar week.
+    prior = df[(df['season'] < current) & (df['week'] == week)]
     versus = value - prior[col].mean() if not prior.empty else None
-    n_prior = prior['year'].nunique()
+    n_prior = prior['season'].nunique()
 
     def signed(delta):
         if delta is None or pd.isna(delta):
@@ -467,7 +557,8 @@ def tiles(label, metric_label, state):
     wow_text, wow_color = signed(wow)
     vs_text, vs_color = signed(versus)
     return [
-        tile(f'{state} · week {week}, {current}', f'{value:.0f}'),
+        tile(f'{state} · week {int(last["cal_week"])}, '
+             f'{season_span(label, current)}', f'{value:.0f}'),
         tile('vs prior week', wow_text, wow_color),
         tile(f'vs {n_prior}-season avg, same week', vs_text, vs_color),
     ]
@@ -493,7 +584,10 @@ app.layout = html.Div([
         html.P(
             'USDA/NASS weekly crop progress. Condition Index = '
             '(5 × Excellent) + (4 × Good) + (3 × Fair) + (2 × Poor) '
-            '+ (1 × Very Poor). Weeks 1–10 are excluded as pre-season.',
+            '+ (1 × Very Poor). Each crop is cut to its own reporting season, '
+            'and winter wheat is grouped by crop year — its autumn '
+            'establishment weeks lead the following summer’s harvest rather '
+            'than trailing the last one.',
             style={'fontSize': '13px', 'color': INK_2, 'margin': '0'}),
     ], style={'margin': '0 0 16px'}),
 
