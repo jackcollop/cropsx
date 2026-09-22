@@ -96,11 +96,17 @@ def in_season(cal_week, label):
 SEASONS = 11
 CACHE_TTL = 3600
 
+# Where the closed seasons are kept once downloaded. Beside the app, so the
+# working directory it is started from does not matter.
+HISTORY_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data')
+
 # --- Palette (dark) ---------------------------------------------------------
 # Dark-mode steps of the same validated system: categorical slots 1 and 2 for
-# the series, its dark chart chrome for everything else.
+# the series, its dark chart chrome for everything else. One plane — the page
+# and the charts share a background, so nothing has to be boxed off from
+# anything else.
 SURFACE = '#1a1a19'
-PAGE = '#0d0d0d'
+HOVER = '#0d0d0d'       # the only thing that floats above the plane
 INK = '#ffffff'
 INK_2 = '#c3c2b7'
 MUTED = '#898781'
@@ -128,6 +134,10 @@ CHANGE_SCALE = [
     [0.00, '#7a1616'], [0.22, '#b8352b'], [0.44, '#383835'],
     [0.56, '#383835'], [0.78, '#3d8b3d'], [1.00, '#2e9b45'],
 ]
+
+
+# Plotly defaults to its own stack; matching the page keeps one typeface.
+FONT = 'system-ui, -apple-system, "Segoe UI", sans-serif'
 
 
 def flip(scale):
@@ -328,15 +338,71 @@ def _merge(cond, prog):
         ['state_alpha', 'season', 'week'])
 
 
+def _pull(commodity, klass, label, stat, tidy, first_year, last_year):
+    """Tidied rows for a year range, state and national level together."""
+    frames = []
+    for level in ('STATE', 'NATIONAL'):
+        try:
+            raw = _request(commodity, klass, first_year, last_year,
+                           stat, level)
+        except Exception:
+            # A crop can be missing a statistic outright, and a level can
+            # fail on its own; whatever did come back is still usable.
+            continue
+        frames.append(tidy(raw, klass, label))
+    frames = [f for f in frames if not f.empty]
+    return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+
+
+def _history(commodity, klass, label, stat, tidy, first_year, last_year):
+    """The closed seasons, fetched once and then read from disk.
+
+    Those years are finished, so re-downloading them on every cold start buys
+    nothing. The window and the crop's season bounds are in the file name, so
+    a file stops being used the moment either changes — including each new
+    year, when the window slides and the history is fetched afresh.
+    """
+    start, end = SEASON[label]
+    slug = label.lower().replace(' ', '-')
+    path = os.path.join(
+        HISTORY_DIR,
+        f'{slug}-{stat.lower()}-{first_year}-{last_year}-w{start}-{end}.csv',
+    )
+    if os.path.exists(path):
+        return pd.read_csv(path)
+
+    out = _pull(commodity, klass, label, stat, tidy, first_year, last_year)
+    if out.empty:
+        return out
+
+    # NASS honours year__GE but not year__LE, so the range came back with the
+    # live season attached. Cut it off, or the file would freeze a half-
+    # finished season and never learn the rest of it. The cut is by date
+    # rather than by season: winter wheat's autumn establishment falls in the
+    # closed years but is stamped with next summer's season, and belongs here.
+    out = out[pd.to_datetime(out['week_ending']).dt.year <= last_year]
+    if out.empty:
+        return out
+
+    os.makedirs(HISTORY_DIR, exist_ok=True)
+    out.to_csv(path, index=False)
+    return out
+
+
 def load(label):
     """Return every state-week for a commodity over the last SEASONS years.
 
-    Four NASS requests — condition and progress, each at state and national
-    level — joined into one frame. The national total arrives as its own
-    reported "state", US, rather than being rebuilt from the states: NASS
-    weights it by acreage, which we do not have. Cached for an hour, so the
-    only thing that costs an API call is picking a commodity you have not
-    looked at yet.
+    Condition and progress, each over two windows: the closed seasons, which
+    come off disk after their first download, and the season under way, which
+    is always fetched. The split is not only for speed — NASS caches a
+    response per query, and the cache behind a wide year range goes stale, so
+    an 11-year request keeps serving last week's file for days after the new
+    one is published. Asking for the live year on its own is what keeps the
+    latest week in the app.
+
+    The national total arrives as its own reported "state", US, rather than
+    being rebuilt from the states: NASS weights it by acreage, which we do
+    not have. The whole frame is cached in memory for an hour.
     """
     commodity, klass = COMMODITIES[label]
     hit = _cache.get(label)
@@ -347,17 +413,18 @@ def load(label):
     first_year = this_year - SEASONS + 1
 
     def pull(stat, tidy):
-        frames = []
-        for level in ('STATE', 'NATIONAL'):
-            try:
-                raw = _request(commodity, klass, first_year, this_year,
-                               stat, level)
-                frames.append(tidy(raw, klass, label))
-            except Exception:
-                continue
+        args = (commodity, klass, label, stat, tidy)
+        frames = [_history(*args, first_year, this_year - 1),
+                  _pull(*args, this_year, this_year)]
         frames = [f for f in frames if not f.empty]
-        return (pd.concat(frames, ignore_index=True) if frames
-                else pd.DataFrame())
+        if not frames:
+            return pd.DataFrame()
+        # A season split across the two windows — winter wheat's autumn
+        # establishment sits in the closed years, its spring in the live one —
+        # is reunited here. The windows do not overlap, but a revised week
+        # would arrive twice if they ever did, so the live rows win.
+        out = pd.concat(frames, ignore_index=True)
+        return out.drop_duplicates(subset=KEYS, keep='last')
 
     cond = pull('CONDITION', _tidy)
     prog = pull('PROGRESS', _tidy_progress)
@@ -440,18 +507,10 @@ def _blank(message):
                        font=dict(size=13, color=INK_2))
     fig.update_layout(
         xaxis=dict(visible=False), yaxis=dict(visible=False),
-        paper_bgcolor=SURFACE, plot_bgcolor=SURFACE, height=460,
-        margin=dict(l=16, r=16, t=16, b=16),
+        paper_bgcolor=SURFACE, plot_bgcolor=SURFACE, height=520,
+        margin=dict(l=16, r=16, t=16, b=16), font=dict(family=FONT),
     )
     return fig
-
-
-def _arrow(delta):
-    if delta is None or pd.isna(delta):
-        return '', ''
-    if abs(delta) < 0.05:
-        return '–', ''
-    return ('▲', f'{delta:.0f}') if delta > 0 else ('▼', f'{abs(delta):.0f}')
 
 
 def map_figure(label, metric_label, mode, selected):
@@ -470,12 +529,10 @@ def map_figure(label, metric_label, mode, selected):
         limit = max(4.0, float(z.abs().max()))
         zmin, zmax = -limit, limit
         scale = CHANGE_SCALE if higher_better else flip(CHANGE_SCALE)
-        bar_title = 'week<br>change'
     else:
         z = snap['value']
         zmin, zmax = span
         scale = LEVEL_SCALE if higher_better else flip(LEVEL_SCALE)
-        bar_title = metric_label.split(' (')[0].replace(' + ', '+<br>')
 
     # The freshest reading on the map, by date — with a wrapping season a high
     # calendar week can be the oldest thing on it, not the newest.
@@ -494,30 +551,25 @@ def map_figure(label, metric_label, mode, selected):
             'week %{customdata[2]}, ending %{customdata[3]}'
             '<extra></extra>'
         ),
+        # The scale is read off the states themselves, which carry their
+        # numbers; the bar only has to say where the ends are.
         colorbar=dict(
-            title=dict(text=bar_title, font=dict(size=11, color=INK_2)),
             thickness=10, len=0.6, x=0.98,
             tickfont=dict(size=10, color=MUTED), outlinewidth=0,
         ),
     ))
 
-    # Two label layers per state: the level above the centroid, the
-    # week-on-week move below it, so neither has to share a line.
+    # One number per state. The week-on-week move used to be a second label
+    # layer under each; it is in the hover, and the change view maps it
+    # properly, so on the level view it was two labels doing one job.
     known = snap[snap['state'].isin(CENTROIDS)]
-    lat = [CENTROIDS[s][0] for s in known['state']]
-    lon = [CENTROIDS[s][1] for s in known['state']]
-    moves = [''.join(_arrow(d)) for d in known['delta']]
-
     fig.add_trace(go.Scattergeo(
-        lat=lat, lon=lon, mode='text', hoverinfo='skip', showlegend=False,
-        text=[f'{s} <b>{v:.0f}</b>'
-              for s, v in zip(known['state'], known['value'])],
-        textposition='top center', textfont=dict(size=12, color=INK),
-    ))
-    fig.add_trace(go.Scattergeo(
-        lat=lat, lon=lon, mode='text', hoverinfo='skip', showlegend=False,
-        text=moves, textposition='bottom center',
-        textfont=dict(size=11, color=INK_2),
+        lat=[CENTROIDS[s][0] for s in known['state']],
+        lon=[CENTROIDS[s][1] for s in known['state']],
+        mode='text', hoverinfo='skip', showlegend=False,
+        text=([f'{v:+.0f}' for v in known['delta']] if mode == 'change'
+              else [f'{v:.0f}' for v in known['value']]),
+        textfont=dict(size=12, color=INK),
     ))
 
     # Ring the selected state rather than recolouring it.
@@ -535,15 +587,12 @@ def map_figure(label, metric_label, mode, selected):
     )
     fig.update_layout(
         title=dict(
-            text=f'{label} — {metric_label} by state'
-                 f'<br><span style="font-size:12px;color:{INK_2}">'
-                 f'week {week}, ending {ending} · labels show the level and '
-                 'the change from the prior week · click a state</span>',
-            font=dict(size=17, color=INK), x=0.02, y=0.97,
+            text=f'{metric_label}, week {week} ending {ending}',
+            font=dict(size=15, color=INK_2), x=0.01, y=0.97,
         ),
-        paper_bgcolor=SURFACE, plot_bgcolor=SURFACE, height=560,
-        margin=dict(l=8, r=8, t=76, b=8), dragmode=False,
-        hoverlabel=dict(bgcolor=PAGE, bordercolor=AXIS,
+        paper_bgcolor=SURFACE, plot_bgcolor=SURFACE, height=520,
+        margin=dict(l=0, r=0, t=44, b=0), dragmode=False, font=dict(family=FONT),
+        hoverlabel=dict(bgcolor=HOVER, bordercolor=AXIS,
                         font=dict(color=INK, size=12)),
     )
     return fig
@@ -616,8 +665,6 @@ def history_figure(label, metric_label, state, xaxis='progress'):
                        font=dict(size=11, color=INK_2)),
             range=[0, 100], dtick=20,
         )
-        against = (f'against the previous {len(prior_years)} seasons, '
-                   'at the same stage of the crop')
     else:
         # Plotted on the crop's own season week so seasons overlay, but ticked
         # in the calendar weeks the trade reads. Only the weeks this crop
@@ -631,14 +678,13 @@ def history_figure(label, metric_label, state, xaxis='progress'):
             tickmode='array', tickvals=ticks,
             ticktext=[str(calendar_week(w, start)) for w in ticks],
         )
-        against = f'against the previous {len(prior_years)} seasons'
 
     fig.update_layout(
+        # The legend already names every season on the chart, so the title
+        # only has to say what is plotted.
         title=dict(
-            text=f'{state} — {metric_label}'
-                 f'<br><span style="font-size:12px;color:{INK_2}">'
-                 f'{season_span(label, current)} {against}</span>',
-            font=dict(size=17, color=INK), x=0.02, y=0.96,
+            text=f'{state}, {metric_label.lower()}',
+            font=dict(size=15, color=INK_2), x=0.01, y=0.97,
         ),
         xaxis=dict(
             gridcolor=GRID, linecolor=AXIS, zeroline=False,
@@ -648,33 +694,33 @@ def history_figure(label, metric_label, state, xaxis='progress'):
             range=list(span), gridcolor=GRID, linecolor=AXIS, zeroline=False,
             tickfont=dict(size=10, color=MUTED),
         ),
-        legend=dict(orientation='h', y=-0.18, x=0,
+        legend=dict(orientation='h', y=-0.16, x=0,
                     font=dict(size=11, color=INK_2)),
         hovermode='closest',
-        hoverlabel=dict(bgcolor=PAGE, bordercolor=AXIS,
+        hoverlabel=dict(bgcolor=HOVER, bordercolor=AXIS,
                         font=dict(color=INK, size=12)),
-        paper_bgcolor=SURFACE, plot_bgcolor=SURFACE, height=560,
-        margin=dict(l=48, r=16, t=76, b=64),
+        paper_bgcolor=SURFACE, plot_bgcolor=SURFACE, height=520,
+        margin=dict(l=36, r=8, t=44, b=56), font=dict(family=FONT),
     )
     return fig
 
 
 # --- Stat tiles -------------------------------------------------------------
 
-TILE = {
-    'flex': '1 1 0', 'padding': '12px 14px', 'background': PAGE,
-    'border': f'1px solid {GRID}', 'borderRadius': '8px',
-}
-TILE_LABEL = {'fontSize': '11px', 'color': MUTED, 'margin': '0 0 4px'}
-TILE_VALUE = {'fontSize': '22px', 'fontWeight': '600', 'color': INK,
-              'margin': '0'}
+# No box, no rule, no background — the numbers are large enough to group
+# themselves, and a card around each would only repeat what the spacing says.
+TILE_VALUE = {'fontSize': '28px', 'fontWeight': '500', 'color': INK,
+              'margin': '0', 'lineHeight': '1.1',
+              'fontVariantNumeric': 'tabular-nums'}
+TILE_LABEL = {'fontSize': '11px', 'color': MUTED, 'margin': '3px 0 0'}
 
 
 def tile(label, value, color=INK):
+    """The reading first, what it is underneath."""
     return html.Div([
-        html.P(label, style=TILE_LABEL),
         html.P(value, style={**TILE_VALUE, 'color': color}),
-    ], style=TILE)
+        html.P(label, style=TILE_LABEL),
+    ], style={'flex': '1 1 0'})
 
 
 def tiles(label, metric_label, state):
@@ -713,10 +759,9 @@ def tiles(label, metric_label, state):
     wow_text, wow_color = signed(wow)
     vs_text, vs_color = signed(versus)
     return [
-        tile(f'{state} · week {int(last["cal_week"])}, '
-             f'{season_span(label, current)}', f'{value:.0f}'),
-        tile('vs prior week', wow_text, wow_color),
-        tile(f'vs {n_prior}-season avg, same week', vs_text, vs_color),
+        tile(f'{state}, {season_span(label, current)}', f'{value:.0f}'),
+        tile('on the week', wow_text, wow_color),
+        tile(f'vs {n_prior}-season average', vs_text, vs_color),
     ]
 
 
@@ -724,25 +769,14 @@ def tiles(label, metric_label, state):
 
 app = Dash(__name__, title='Crop Conditions')
 
-CARD = {
-    'background': SURFACE, 'border': f'1px solid {GRID}',
-    'borderRadius': '10px', 'padding': '8px',
-}
 FIELD = {'fontSize': '11px', 'color': MUTED, 'margin': '0 0 5px'}
 
 app.layout = html.Div([
-    html.Div([
-        html.H1('Crop conditions', style={
-            'fontSize': '24px', 'fontWeight': '600', 'color': INK,
-            'margin': '0 0 4px'}),
-        html.P(
-            'USDA/NASS weekly crop progress. Condition Index = '
-            '(5 × Excellent) + (4 × Good) + (3 × Fair) + (2 × Poor) '
-            '+ (1 × Very Poor). Progress Index = the sum of every stage '
-            'percentage ÷ (100 × the number of stages), 0 = before planting, '
-            'and 100 = fully harvested.',
-            style={'fontSize': '13px', 'color': INK_2, 'margin': '0'}),
-    ], style={'margin': '0 0 16px'}),
+    # The index definitions used to sit here as a paragraph nobody reading a
+    # condition number needs; they are in the hover and the axis instead.
+    html.H1('Crop conditions', style={
+        'fontSize': '20px', 'fontWeight': '600', 'color': INK,
+        'margin': '0 0 18px'}),
 
     html.Div([
         html.Div([
@@ -788,14 +822,14 @@ app.layout = html.Div([
 
     html.Div([
         html.Div(dcc.Graph(id='map', config={'displayModeBar': False}),
-                 style={**CARD, 'flex': '1 1 560px'}),
+                 style={'flex': '1 1 560px'}),
         html.Div([
-            html.Div(id='tiles', style={'display': 'flex', 'gap': '8px',
-                                        'margin': '0 0 8px'}),
+            html.Div(id='tiles', style={'display': 'flex', 'gap': '20px',
+                                        'margin': '0 0 14px'}),
             dcc.Graph(id='history', config={'displayModeBar': False}),
-        ], style={**CARD, 'flex': '1 1 460px'}),
-    ], style={'display': 'flex', 'gap': '14px', 'flexWrap': 'wrap'}),
-], style={'background': PAGE, 'minHeight': '100vh', 'padding': '24px',
+        ], style={'flex': '1 1 460px'}),
+    ], style={'display': 'flex', 'gap': '32px', 'flexWrap': 'wrap'}),
+], style={'background': SURFACE, 'minHeight': '100vh', 'padding': '28px 32px',
           'boxSizing': 'border-box'})
 
 
